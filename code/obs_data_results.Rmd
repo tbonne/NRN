@@ -1,0 +1,482 @@
+---
+title: "Behavioural reaction norms in a baboon troop"
+output: html_notebook2
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='Figs/',
+                      echo=FALSE,include=FALSE, warning=FALSE, message=FALSE)
+```
+
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+library(devtools, quietly = T)
+library(rethinking)
+library(ggplot2, quietly = T)
+library(mgcv, quietly = T)
+library(data.table, quietly = T)
+#devtools::install_github("tbonne/netTS") #To install the package (run if updates have occured)
+library(netTS)
+library(stringr)
+library(lubridate)
+library(reshape2)
+library(brms)
+library(stringr)
+library(grid)
+library(dplyr, quietly = T)
+library(igraph)
+```
+
+
+# I) Strength NRN
+
+## Strength data
+
+```{r}
+ind.data <- read.csv("network_strength_env.csv")
+
+ind.data
+```
+
+
+```{r Setup data for model}
+
+#scale all indenpendent variables
+ind.data$sis.s <- as.numeric(scale(ind.data$meanSIS))
+ind.data$rain.s <- as.numeric(scale(ind.data$meanRain))
+ind.data$strenRate.s <- as.numeric(scale(ind.data$value/ind.data$hours))
+
+#get day of year
+ind.data$windowstart <- ymd(ind.data$windowstart) 
+ind.data$windowend <- ymd(ind.data$windowend) 
+ind.data$day_year <- yday(ind.data$windowstart + 90)
+ind.data$day_year.s <- as.numeric(scale(ind.data$day_year))
+
+#for back transforming later
+backT.strRate.mean <- mean(ind.data$value/ind.data$hours)
+backT.strRate.sd <- sd(ind.data$value/ind.data$hours)
+backT.sis.mean <- mean(ind.data$meanSIS)
+backT.sis.sd <- sd(ind.data$meanSIS)
+backT.rain.mean <- mean(ind.data$meanRain)
+backT.rain.sd <- sd(ind.data$meanRain)
+strenRate.back.mean <- attr(scale(ind.data$stren/ind.data$hours),"scaled:center" )#0.2434735
+strenRate.back.sd <- attr(scale(ind.data$stren/ind.data$hours),"scaled:scale" )
+
+
+#get days since the first window
+ind.data$daysSinceStart <- as.numeric(ind.data$windowstart - min(ind.data$windowstart))
+ind.data$windID <- ind.data$daysSinceStart/80 + 1
+ind.data$daysSinceStart.s <- as.numeric(scale(ind.data$daysSinceStart))
+
+#get the mean for each individual
+ind.data <- ind.data %>% dplyr::group_by(variable) %>% dplyr::mutate(rain.mean = mean(rain.s, na.rm=T), sis.mean = mean(sis.s,na.rm=T))
+
+#make sure ID's are factors (BRMS by requirment for splines)
+ind.data$ID <- factor(ind.data$variable)
+ind.data
+
+```
+
+
+Plots before modeling
+```{r}
+
+ggplot(ind.data, aes(y=strenRate.s, x=rain.s,group=ID))+geom_point() + geom_smooth(method = "lm")+ facet_wrap(vars(ID))
+
+ggplot(ind.data, aes(y=strenRate.s, x=sis.s,group=ID))+geom_point() + geom_smooth(method = "lm")+ facet_wrap(vars(ID))
+
+```
+
+## Fit a NRN for strength
+
+Using brms
+```{r}
+
+#remove some of the individuals without enough data to estimate sigma independently of the others
+df.ind.points <- ind.data %>% filter(!is.na(strenRate.s)) %>% group_by(ID) %>% tally()
+names.to.keep <- as.character(df.ind.points[df.ind.points$n>=5,]$ID)
+ind.data.sub <- ind.data %>% filter(ID %in% names.to.keep)
+
+#build model
+fit.test.stren.linear <- brm(bf(strenRate.s ~ 0 + rain.s + rain.mean + sis.s + sis.mean + arma(time=windID, gr=ID, p=1,q=0) + (1+sis.s+rain.s|q|ID), sigma ~ 0 + (1|q|ID) ) , data = ind.data, family=gaussian , prior = prior("normal(0,1)", class="b")+prior("normal(0.5,0.2)",class="ar") + prior("normal(0,1)",class="sd"), iter=2000, cores=4, chains=4, control = list(adapt_delta=0.95, max_treedepth=14) ) 
+
+#check summary
+summary(fit.test.stren.linear)
+
+#pp check 
+pp_check(fit.test.stren.linear)
+
+#check conditional effects
+plot(conditional_effects(fit.test.stren.linear,points=F),ask=F)
+```
+
+## Visualize the strength NRN
+
+```{r Strength solar NRN}
+
+#Create a new dataset target to changes in sis
+npred <- 100
+unique.names <- unique(ind.data.sub$ID)
+newdata.full <- data.frame(sis.s=0,rain.s=0,day_year.s=0,rain.mean=0,sis.mean=0, ID="Sarah", yday=-1,day=-1, windID=1)
+
+#loop through and create a dataframe for each id
+for(i in 1:length(unique.names)){
+  
+  #create a dataframe for one individual
+  newdata.id <- data.frame(
+    sis.s = seq(-2,2,length.out = npred),
+    rain.s = 0,
+    day_year.s = 0,
+    rain.mean = 0,
+    sis.mean = 0,
+    ID = rep(unique.names[i],npred),
+    yday =1,
+    windID=1,
+    day=1
+    
+  )
+  
+  newdata.full <- rbind(newdata.full, newdata.id)
+  
+}
+newdata.full <- newdata.full[-1,]
+
+#Make predictions using this dataset
+newdata.full$ID <- factor(newdata.full$ID)
+df.pred<-fitted(fit.test.stren.linear, newdata=newdata.full,summary=F, incl_autocor = F) 
+
+#back transform dependent
+back.strRate <- function(x){
+  (x*backT.strRate.sd)+backT.strRate.mean
+}
+back.strRate.t<-back.strRate(df.pred)
+
+#get the summary stats
+
+pred.mean <- apply(back.strRate.t, 2,mean)
+pred.hdi <- apply(back.strRate.t, 2,HPDI,prob=0.95)
+
+
+#plot out the model predictions
+newdata.full.comb<-cbind(as.data.frame(newdata.full),data.frame(Estimate=pred.mean,low.ci=pred.hdi[1,],up.ci=pred.hdi[2,]))
+
+#back transform the independent
+newdata.full.comb$sis<- (newdata.full.comb$sis.s*backT.sis.sd) + backT.sis.mean
+
+#create the plot
+g.sis.str<- ggplot(newdata.full.comb, aes(x=sis,y=Estimate, group=ID)) + 
+  geom_ribbon(aes(ymin = low.ci, ymax = up.ci), fill = "grey90", linetype="blank", alpha=0.1)+
+  geom_line( size=0.3 )+ 
+  theme_classic() + labs(y="Strength rate (contacts/hour)", x="Solar Radiation (W/m2)") + theme(legend.position = "none")
+
+#take a look
+g.sis.str 
+
+
+
+```
+
+```{r Strength rain NRN}
+
+#Create a new dataset target to changes in sis
+npred <- 100
+unique.names <- unique(ind.data.sub$ID)
+newdata.full <- data.frame(sis.s=0,rain.s=0,day_year.s=0,rain.mean=0,sis.mean=0, ID="Sarah", yday=-1,day=-1, windID=1)
+
+#loop through and create a dataframe for each id
+for(i in 1:length(unique.names)){
+  
+  #create a dataframe for one individual
+  newdata.id <- data.frame(
+    sis.s = 0,
+    rain.s = seq(-2,2,length.out = npred),
+    day_year.s = 0,
+    rain.mean = 0,
+    sis.mean = 0,
+    ID = rep(unique.names[i],npred),
+    yday =1,
+    windID=1,
+    day=1
+    
+  )
+  
+  newdata.full <- rbind(newdata.full, newdata.id)
+  
+}
+newdata.full <- newdata.full[-1,]
+
+#Make predictions using this dataset
+newdata.full$ID <- factor(newdata.full$ID)
+df.pred<-fitted(fit.test.stren.linear, newdata=newdata.full,summary=F, incl_autocor = F) 
+
+#back transform
+back.strRate <- function(x){
+  (x*backT.strRate.sd)+backT.strRate.mean
+}
+back.strRate.t<-back.strRate(df.pred)
+
+#get the summary stats
+
+pred.mean <- apply(back.strRate.t, 2,mean)
+pred.hdi <- apply(back.strRate.t, 2,HPDI,prob=0.95)
+
+
+#plot out the model predictions
+newdata.full.comb<-cbind(as.data.frame(newdata.full),data.frame(Estimate=pred.mean,low.ci=pred.hdi[1,],up.ci=pred.hdi[2,]))
+
+#back transform the independent variable
+newdata.full.comb$rain<- (newdata.full.comb$rain.s*backT.rain.sd) + backT.rain.mean
+
+#create the plot
+g.rain.str<- ggplot(newdata.full.comb, aes(x=rain,y=Estimate, group=ID)) + 
+  geom_ribbon(aes(ymin = low.ci, ymax = up.ci), fill = "grey90", linetype="blank", alpha=0.1)+
+  geom_line( size=0.3 )+ 
+  theme_classic() + labs(y="Strength rate (contacts/hour)", x="Rainfall (mm)") + theme(legend.position = "none")
+
+#take a look
+g.rain.str 
+
+
+
+```
+
+
+
+
+#II) Eigenvector centrality NRN
+
+## Eigen data
+
+```{r}
+eig.data <- read.csv("network_eigenvector_env.csv")
+
+eig.data
+```
+
+
+```{r Setup data for model}
+
+#scale all indenpendent variables
+eig.data$sis.s <- as.numeric(scale(eig.data$meanSIS))
+eig.data$rain.s <- as.numeric(scale(eig.data$meanRain))
+eig.data$eig.s <- as.numeric(scale(eig.data$value))
+eig.data$hours.s <- as.numeric(scale(eig.data$hours))
+
+#get day of year
+eig.data$windowstart <- ymd(eig.data$windowstart)
+eig.data$windowend <- ymd(eig.data$windowend)
+eig.data$day_year <- yday(eig.data$windowstart + days(window.size))
+eig.data$day_year.s <- as.numeric(scale(eig.data$day_year))
+
+#for back transforming later
+backT.eig.mean <- mean(eig.data$value)
+backT.eig.sd <- sd(eig.data$value)
+backT.sis.mean <- mean(ind.data$meanSIS)
+backT.sis.sd <- sd(ind.data$meanSIS)
+backT.rain.mean <- mean(ind.data$meanRain)
+backT.rain.sd <- sd(ind.data$meanRain)
+eig.back.mean <- attr(scale(eig.data$value),"scaled:center" )
+eig.back.sd <- attr(scale(eig.data$value),"scaled:scale" )
+
+#get days from first window
+eig.data$daysSinceStart <- as.numeric(eig.data$windowstart - min(eig.data$windowstart))
+eig.data$windID <- eig.data$daysSinceStart/80 + 1
+eig.data$daysSinceStart.s <- as.numeric(scale(eig.data$daysSinceStart))
+
+#get the mean for each individual
+eig.data <- eig.data %>% dplyr::group_by(variable) %>% dplyr::mutate(rain.mean = mean(rain.s, na.rm=T), sis.mean = mean(sis.s,na.rm=T))
+
+#make sure ID's are factors (BRMS by requirment for splines)
+eig.data$ID <- factor(eig.data$variable)
+eig.data
+
+
+```
+
+## Fit a NRN for eigenvector
+
+Using brms
+```{r}
+
+#remove some of the individuals without enough data to estimate sigma independently of the others
+df.ind.points <- eig.data %>% filter(!is.na(value)) %>% group_by(ID) %>% tally()
+names.to.keep <- as.character(df.ind.points[df.ind.points$n>=5,]$ID)
+eig.data.sub <- eig.data %>% filter(ID %in% names.to.keep)
+
+#build model
+fit.test.eig.linear <- brm(bf(eig.s ~ 0 + rain.s + rain.mean + sis.s + sis.mean + arma(time=windID, gr=ID, p=1,q=0) + (1+sis.s+rain.s|q|ID), sigma ~ 0 + (1|q|ID) ) , data = eig.data, family=gaussian , prior = prior("normal(0,1)", class="b")+prior("normal(0.5,0.2)",class="ar") + prior("normal(0,1)",class="sd"), iter=2000, cores=4, chains=4, control = list(adapt_delta=0.95, max_treedepth=14) ) 
+
+#check summary
+summary(fit.test.eig.linear)
+
+#pp check
+pp_check(fit.test.eig.linear)
+
+#check conditional effects
+plot(conditional_effects(fit.test.eig.linear,points=F),ask=F)
+```
+
+## Visualize eigenvector NRN
+
+```{r Eigen solar NRN}
+
+#Create a new dataset target to changes in sis
+npred <- 100
+unique.names <- unique(eig.data.sub$ID)
+newdata.full <- data.frame(sis.s=0,rain.s=0,day_year.s=0,rain.mean=0,sis.mean=0, ID="Sarah", yday=-1,day=-1, windID=1)
+
+#loop through and create a dataframe for each id
+for(i in 1:length(unique.names)){
+  
+  #create a dataframe for one individual
+  newdata.id <- data.frame(
+    sis.s = seq(-2,2,length.out = npred),
+    rain.s = 0,
+    day_year.s = 0,
+    rain.mean = 0,
+    sis.mean = 0,
+    ID = rep(unique.names[i],npred),
+    yday =1,
+    windID=1,
+    day=1
+    
+  )
+  
+  newdata.full <- rbind(newdata.full, newdata.id)
+  
+}
+newdata.full <- newdata.full[-1,]
+
+#Make predictions using this dataset
+newdata.full$ID <- factor(newdata.full$ID)
+df.pred<-fitted(fit.test.eig.linear, newdata=newdata.full,summary=F, incl_autocor = F) 
+
+#back transform dependent
+back.eig <- function(x){
+  (x*backT.eig.sd)+backT.eig.mean
+}
+back.eig.t<-back.eig(df.pred)
+
+#get the summary stats
+
+pred.mean <- apply(back.eig.t, 2,mean)
+pred.hdi <- apply(back.eig.t, 2,HPDI,prob=0.95)
+
+
+#plot out the model predictions
+newdata.full.comb<-cbind(as.data.frame(newdata.full),data.frame(Estimate=pred.mean,low.ci=pred.hdi[1,],up.ci=pred.hdi[2,]))
+
+#back transform the independent
+newdata.full.comb$sis<- (newdata.full.comb$sis.s*backT.sis.sd) + backT.sis.mean
+
+#create the plot
+g.sis.eig<- ggplot(newdata.full.comb, aes(x=sis,y=Estimate, group=ID)) + 
+  geom_ribbon(aes(ymin = low.ci, ymax = up.ci), fill = "grey90", linetype="blank", alpha=0.1)+
+  geom_line( size=0.3 )+ 
+  theme_classic() + labs(y="Eigenvector centrality", x="Solar Radiation (W/m2)") + theme(legend.position = "none")
+
+#take a look
+g.sis.eig 
+
+
+
+```
+
+```{r Eigen rain NRN}
+
+#Create a new dataset target to changes in sis
+npred <- 100
+unique.names <- unique(eig.data.sub$ID)
+newdata.full <- data.frame(sis.s=0,rain.s=0,day_year.s=0,rain.mean=0,sis.mean=0, ID="Sarah", yday=-1,day=-1, windID=1)
+
+#loop through and create a dataframe for each id
+for(i in 1:length(unique.names)){
+  
+  #create a dataframe for one individual
+  newdata.id <- data.frame(
+    sis.s = 0,
+    rain.s = seq(-2,2,length.out = npred),
+    day_year.s = 0,
+    rain.mean = 0,
+    sis.mean = 0,
+    ID = rep(unique.names[i],npred),
+    yday =1,
+    windID=1,
+    day=1
+    
+  )
+  
+  newdata.full <- rbind(newdata.full, newdata.id)
+  
+}
+newdata.full <- newdata.full[-1,]
+
+#Make predictions using this dataset
+newdata.full$ID <- factor(newdata.full$ID)
+df.pred<-fitted(fit.test.eig.linear, newdata=newdata.full,summary=F, incl_autocor = F) 
+
+#back transform dependent
+back.eig <- function(x){
+  (x*backT.eig.sd)+backT.eig.mean
+}
+back.eig.t<-back.eig(df.pred)
+
+#get the summary stats
+
+pred.mean <- apply(back.eig.t, 2,mean)
+pred.hdi <- apply(back.eig.t, 2,HPDI,prob=0.95)
+
+
+#plot out the model predictions
+newdata.full.comb<-cbind(as.data.frame(newdata.full),data.frame(Estimate=pred.mean,low.ci=pred.hdi[1,],up.ci=pred.hdi[2,]))
+
+#back transform the independent
+newdata.full.comb$rain<- (newdata.full.comb$rain.s*backT.rain.sd) + backT.rain.mean
+
+#create the plot
+g.rain.eig<- ggplot(newdata.full.comb, aes(x=rain,y=Estimate, group=ID)) + 
+  geom_ribbon(aes(ymin = low.ci, ymax = up.ci), fill = "grey90", linetype="blank", alpha=0.1)+
+  geom_line( size=0.3 )+ 
+  theme_classic() + labs(y="Eigenvector centrality", x="Rainfall (mm)") + theme(legend.position = "none")
+
+#take a look
+g.rain.eig 
+
+
+
+```
+
+
+# III) Outputs for the paper
+
+```{r summary table}
+summary(fit.test.stren.linear)
+summary(fit.test.eig.linear)
+
+ranef(fit.test.stren.linear)
+ranef(fit.test.eig.linear)
+
+```
+
+```{r}
+r2_str_cond<-bayes_R2(fit.test.stren.linear, incl_autocor = F)
+r2_str_marg<-bayes_R2(fit.test.stren.linear, re_formula=NA, incl_autocor = F)
+
+r2_eig_cond<-bayes_R2(fit.test.eig.linear, incl_autocor = F)
+r2_eig_marg<-bayes_R2(fit.test.eig.linear, re_formula=NA, incl_autocor = F)
+
+r2_str_cond
+r2_str_marg
+
+r2_eig_cond
+r2_eig_marg
+
+```
+
+
+
+```{r NRN combined plots}
+
+cowplot::plot_grid(g.sis.str + ylim(0,1.2) ,g.rain.str+ ylim(0,1.2),g.sis.eig+ ylim(0.0,0.45),g.rain.eig+ ylim(0.0,0.45),ncol=2, labels = c("a)","b)","c)","d)") )
+
+```
