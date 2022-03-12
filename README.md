@@ -1,4 +1,4 @@
-# Network reaction norms: taking into account network position and plasticity in response to environmental change
+# Network reaction norms
 
 To better consider variation in an individual node's position and response (i.e., plasticity) to environmental change we introduce the network reaction norm (NRN) approach. 
 
